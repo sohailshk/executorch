@@ -2296,6 +2296,51 @@ class TestPasses(unittest.TestCase):
             if user is not copy and user.op != "output":
                 self.assertLess(node_order[user], node_order[copy])
 
+    def test_mutable_buffer_set_from_another_buffer_is_written_back(self) -> None:
+        class CopyFromBufferModule(torch.nn.Module):
+            def __init__(self, names, delegated):
+                super().__init__()
+                self.delegated = delegated
+                for name in names:
+                    self.register_buffer(name, torch.zeros(1))
+
+            def forward(self, x):
+                # With a delegate, the output reads both buffers
+                out = self.prev + self.prev if self.delegated else self.prev.clone()
+                self.prev.copy_(self.cur)
+                self.cur.add_(x)
+                return out
+
+        x = torch.full((1,), 3.0)
+        for names, delegated in itertools.product(
+            (("prev", "cur"), ("cur", "prev")), (False, True)
+        ):
+            with self.subTest(names=names, delegated=delegated):
+                model = to_edge(
+                    export(
+                        CopyFromBufferModule(names, delegated),
+                        (torch.zeros(1),),
+                        strict=False,
+                    )
+                )
+                if delegated:
+                    model = model.to_backend(XnnpackPartitioner())
+                ep = model.exported_program()
+                gm, _ = insert_write_back_for_buffers_pass(ep)
+
+                eager = CopyFromBufferModule(names, delegated)
+                buffers = {"prev": torch.zeros(1), "cur": torch.zeros(1)}
+                for _ in range(4):
+                    expected = eager(x)
+                    args = [
+                        buffers[spec.target] if spec.target else x
+                        for spec in ep.graph_signature.input_specs
+                    ]
+                    actual = gm(*args)[-1]
+                    self.assertTrue(torch.equal(actual, expected))
+                    self.assertTrue(torch.equal(buffers["prev"], eager.prev))
+                    self.assertTrue(torch.equal(buffers["cur"], eager.cur))
+
     def test_mutable_buffers_write_back_after_view_reads(self) -> None:
         class ViewReadModule(torch.nn.Module):
             def __init__(self):
@@ -2343,8 +2388,8 @@ class TestPasses(unittest.TestCase):
                 # the two write-backs are not independent: after the view
                 # rewrite the value written into b aliases the buffer the
                 # other copy_ mutates. The pass must fall back to inserting
-                # both copies at the end of the graph in their original
-                # order.
+                # both copies at the end of the graph, with b's copy (which
+                # reads a) before a's.
                 self.b.copy_(self.a.view(2, 2))
                 self.a.add_(x)
                 return x + 1
@@ -2369,7 +2414,8 @@ class TestPasses(unittest.TestCase):
         )
         for copy_node in copies:
             self.assertGreater(node_order[copy_node], last_compute)
-        # The copies keep their original (output-spec) order.
+        # b's copy reads a, so it comes before a's copy (b is also first in
+        # the output specs with strict export).
         output_args = gm.graph.output_node().args[0]
         self.assertEqual([output_args[0], output_args[1]], copies)
 

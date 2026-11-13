@@ -267,6 +267,45 @@ def _insertion_point(
     return latest
 
 
+def _order_copies_by_reads(
+    copies: List[Tuple[int, torch.fx.Node, torch.fx.Node]],
+    alias_index: _AliasIndex,
+) -> List[Tuple[int, torch.fx.Node, torch.fx.Node]]:
+    """
+    Order the copies so that one whose value may alias the destination of
+    another runs before that one, since the value must be read before the
+    destination is overwritten. Other copies keep their original order. The
+    alias answers are conservative (e.g. the outputs of a delegate count as
+    aliases of all its inputs), so the reads can look cyclic even when they
+    are not. In that case the next copy is the first one whose destination no
+    other copy reads directly.
+    """
+
+    def is_unread(copy, direct: bool) -> bool:
+        mutated = copy[1]
+        return not any(
+            other is not copy
+            and (
+                other[2] is mutated
+                if direct
+                else bool(alias_index.aliases(other[2]) & alias_index.aliases(mutated))
+            )
+            for other in remaining
+        )
+
+    ordered: List[Tuple[int, torch.fx.Node, torch.fx.Node]] = []
+    remaining = list(copies)
+    while remaining:
+        ready = next((c for c in remaining if is_unread(c, direct=False)), None)
+        if ready is None:
+            ready = next(
+                (c for c in remaining if is_unread(c, direct=True)), remaining[0]
+            )
+        ordered.append(ready)
+        remaining.remove(ready)
+    return ordered
+
+
 def _insert_copy(
     gm: torch.fx.GraphModule,
     mutated_outputs: List[Optional[str]],
@@ -319,8 +358,8 @@ def _insert_copy(
         # by one copy may alias the buffer mutated by another, then the order
         # of the copies (and their position relative to everything else)
         # matters in ways the insertion points below do not track, so fall
-        # back to inserting all of them at the end of the graph, in their
-        # original order, as before.
+        # back to inserting all of them at the end of the graph, with a copy
+        # that reads another copy's destination placed before that copy.
         independent = True
         if len(copies) > 1:
             mutated_aliases: Set[torch.fx.Node] = set()
@@ -339,6 +378,9 @@ def _insert_copy(
                     break
                 mutated_aliases |= mutated_alias
                 return_aliases |= return_alias
+
+        if not independent:
+            copies = _order_copies_by_reads(copies, alias_index)
 
         for position, mutated_node, return_node in copies:
             if independent:
@@ -376,9 +418,11 @@ def _inplace_lineage(
     output_arg: torch.fx.Node,
     gs: ExportGraphSignature,
     kind: SchemaKind,
+    target: str,
 ) -> bool:
     """
-    Walk the graph backwards to see if output_arg is ultimately the same as an input.
+    Walk the graph backwards to see if output_arg is ultimately the input that
+    target names.
     """
     if kind != OutputKind.BUFFER_MUTATION and kind != OutputKind.USER_INPUT_MUTATION:
         return False
@@ -390,12 +434,12 @@ def _inplace_lineage(
         else:
             return False
 
-    # If the output arg was a buffer then it needs to reach a buffer placeholder
+    # If the output arg was a buffer then it needs to reach that buffer's placeholder
     if kind == OutputKind.BUFFER_MUTATION:
-        return output_arg.target in gs.inputs_to_buffers
-    # If the output arg was a user input then it needs to reach a user input placeholder
+        return gs.inputs_to_buffers.get(output_arg.target) == target
+    # If the output arg was a user input then it needs to reach that user input's placeholder
     assert kind == OutputKind.USER_INPUT_MUTATION
-    return output_arg.target in gs.user_inputs
+    return output_arg.target == target
 
 
 def insert_write_back_for_buffers_pass(
@@ -446,6 +490,7 @@ def insert_write_back_for_buffers_pass(
                 output_node.args[0][i],
                 ep.graph_signature,
                 ep.graph_signature.output_specs[i].kind,
+                out_spec.target,
             )
         ):
             mutated_outputs.append(out_spec.target)
